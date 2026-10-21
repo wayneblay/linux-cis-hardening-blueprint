@@ -1,0 +1,1347 @@
+================================================================================
+        LINUX SERVER HARDENING BLUEPRINT -- CIS BENCHMARK ALIGNED
+              Red Hat Enterprise Linux 9  |  Ubuntu 22.04 / 24.04 LTS
+================================================================================
+
+SCOPE & HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Target baseline : CIS Benchmark, Level 1 - Server profile (private sector).
+                  Level 2 items are included where useful and are marked [L2].
+Platforms       : RHEL 9 (and rebuilds: Rocky / Alma 9). Notes for RHEL 10
+                  are given where behaviour differs.
+                  Ubuntu Server 22.04 LTS and 24.04 LTS.
+
+Tags used throughout:
+  [ALL]     Same command on both distributions
+  [RHEL]    RHEL 9 only
+  [UBUNTU]  Ubuntu 22.04 / 24.04 only
+  [L1]      CIS Level 1 Server control
+  [L2]      CIS Level 2 control (stricter, more operational impact)
+  [REC]     Recommended practice, not a CIS scored control
+
+IMPORTANT
+  * This blueprint maps to CIS recommendations but is NOT a copy of the CIS
+    Benchmark. Verify control IDs and exact values against the licensed CIS
+    Benchmark version your auditors use.
+  * Test on a non-production system or snapshot first.
+  * Keep console / out-of-band access (iLO, iDRAC, hypervisor console, cloud
+    serial console) available. Several phases can lock you out of SSH.
+  * Run commands as a sudo-capable user. All heredocs use 'EOF' (quoted) so
+    nothing inside is expanded by the shell.
+  * Not every host fits every control. Known conflicts are listed in the
+    "EXCEPTIONS" section at the end -- read it before you start.
+
+
+--------------------------------------------------------------------------------
+PHASE 0: PRE-FLIGHT
+--------------------------------------------------------------------------------
+1. Confirm OS and version:  [ALL]
+   ------------------------
+   cat /etc/os-release
+   uname -r
+
+2. Back up configuration and take a snapshot:  [ALL]
+   ------------------------------------------
+   sudo tar -czpf /root/etc-backup-$(date +%F).tar.gz /etc
+   # Also take a VM / cloud snapshot if available.
+
+3. Keep a second root-capable session open:  [ALL]
+   ----------------------------------------
+   Open a second SSH session (or console) and leave it logged in until
+   every phase that touches SSH, PAM, sudo or the firewall has been tested.
+
+4. Take a baseline compliance scan:  [REC]
+   --------------------------------
+   Run the scan in PHASE 16 now and save the report. Re-run it at the end
+   to show before/after results.
+
+
+--------------------------------------------------------------------------------
+PHASE 1: STORAGE & FILESYSTEM HARDENING
+--------------------------------------------------------------------------------
+1. Partition layout and mount options (/etc/fstab):  [ALL]
+   ------------------------------------------------
+   Partitions must be created at install time (Anaconda/Kickstart or the
+   Ubuntu installer / autoinstall). They cannot be safely added in place.
+
+   Mount point      Separate partition   Required mount options
+   ---------------  -------------------  ---------------------------------
+   /tmp             [L1]                 nodev,nosuid,noexec
+   /dev/shm         (tmpfs, always)      nodev,nosuid,noexec
+   /home            [L2]                 nodev,nosuid
+   /var             [L2]                 nodev,nosuid
+   /var/tmp         [L2]                 nodev,nosuid,noexec
+   /var/log         [L2]                 nodev,nosuid,noexec
+   /var/log/audit   [L2]                 nodev,nosuid,noexec
+
+   The mount OPTIONS are [L1] wherever the separate partition exists.
+
+   Example /etc/fstab lines (LVM; adjust device names to your system):
+     /dev/mapper/vg-tmp      /tmp            xfs   defaults,nodev,nosuid,noexec 0 0
+     /dev/mapper/vg-var      /var            xfs   defaults,nodev,nosuid        0 0
+     /dev/mapper/vg-vartmp   /var/tmp        xfs   defaults,nodev,nosuid,noexec 0 0
+     /dev/mapper/vg-log      /var/log        xfs   defaults,nodev,nosuid,noexec 0 0
+     /dev/mapper/vg-audit    /var/log/audit  xfs   defaults,nodev,nosuid,noexec 0 0
+     /dev/mapper/vg-home     /home           xfs   defaults,nodev,nosuid        0 0
+     tmpfs                   /dev/shm        tmpfs defaults,nodev,nosuid,noexec 0 0
+
+   (Ubuntu typically uses ext4 rather than xfs.)
+
+   If /tmp is NOT a separate partition, mount it as tmpfs instead:
+     tmpfs  /tmp  tmpfs  defaults,rw,nosuid,nodev,noexec,relatime,size=2G 0 0
+
+2. Validate and apply without rebooting:  [ALL]
+   -------------------------------------
+   sudo findmnt --verify
+   sudo systemctl daemon-reload
+   for m in /tmp /dev/shm /home /var /var/tmp /var/log /var/log/audit; do
+     findmnt -n "$m" >/dev/null && sudo mount -o remount "$m"
+   done
+   findmnt -n -o TARGET,OPTIONS /tmp /dev/shm /var/tmp
+
+3. Ubuntu: let apt work with a noexec /tmp:  [UBUNTU]
+   ---------------------------------------
+   debconf extracts and runs package config scripts from /tmp, which fails
+   when /tmp is noexec. Point it at a different directory:
+
+   sudo mkdir -p /var/cache/apt/tmp
+   echo 'APT::ExtractTemplates::TempDir "/var/cache/apt/tmp";' | \
+     sudo tee /etc/apt/apt.conf.d/50extracttemplates
+
+4. Disk encryption (LUKS2):  [REC]
+   ------------------------
+   CIS does not score this, but it is strongly recommended.
+   RHEL   : select "Encrypt my data" in Anaconda, or use 'part ... --encrypted'
+            / 'logvol ... --encrypted --luks-version=luks2' in Kickstart.
+   Ubuntu : choose "Use LVM with encryption" in the installer, or set
+            storage: layout: { name: lvm, password: ... } in autoinstall.
+
+   Verify:
+     lsblk -f
+     sudo cryptsetup luksDump /dev/<partition> | grep -E 'Version|Cipher'
+
+   FIPS mode is NOT required by CIS. Enable it only if a contract or
+   regulation requires it, and only at install time (fips=1 on the
+   installer boot line). It changes allowed crypto system-wide.
+
+
+--------------------------------------------------------------------------------
+PHASE 2: SOFTWARE SOURCES & PATCHING
+--------------------------------------------------------------------------------
+1. Enforce package signature checking:  [L1]
+   -----------------------------------
+   [RHEL]
+   sudo sed -ri 's/^\s*gpgcheck\s*=.*/gpgcheck=1/' /etc/dnf/dnf.conf
+   sudo sed -ri 's/^\s*gpgcheck\s*=\s*0/gpgcheck=1/' /etc/yum.repos.d/*.repo
+   grep -H gpgcheck /etc/dnf/dnf.conf /etc/yum.repos.d/*.repo
+
+   [UBUNTU]
+   # No repository should be marked trusted or allow unauthenticated packages
+   grep -RniE 'trusted=yes|AllowUnauthenticated' /etc/apt/ || echo "OK"
+
+2. Apply all current updates:  [L1]
+   --------------------------
+   [RHEL]    sudo dnf -y upgrade
+   [UBUNTU]  sudo apt update && sudo apt -y full-upgrade
+
+3. Automatic security updates:  [REC]
+   ---------------------------
+   [RHEL]
+   sudo dnf install -y dnf-automatic
+   sudo sed -ri 's/^\s*upgrade_type\s*=.*/upgrade_type = security/' /etc/dnf/automatic.conf
+   sudo sed -ri 's/^\s*apply_updates\s*=.*/apply_updates = yes/' /etc/dnf/automatic.conf
+   sudo systemctl enable --now dnf-automatic.timer
+   # RHEL 10 uses dnf5; its automatic config lives in /etc/dnf/automatic.conf
+   # with a different layout -- check 'man dnf5-automatic'.
+
+   [UBUNTU]
+   sudo apt install -y unattended-upgrades
+   sudo dpkg-reconfigure -f noninteractive -plow unattended-upgrades
+
+
+--------------------------------------------------------------------------------
+PHASE 3: BOOTLOADER & KERNEL COMMAND LINE
+--------------------------------------------------------------------------------
+1. Set a bootloader password:  [L1]
+   --------------------------
+   This sets a GRUB password; it does not encrypt anything. It stops anyone
+   at the console from editing kernel arguments (e.g. init=/bin/bash).
+
+   [RHEL]
+   sudo grub2-setpassword
+   # Creates /boot/grub2/user.cfg. Normal boots do not prompt; editing does.
+
+   [UBUNTU]
+   grub-mkpasswd-pbkdf2
+   # Copy the hash it prints (starts with grub.pbkdf2.sha512...), then:
+   cat << 'EOF' | sudo tee -a /etc/grub.d/40_custom
+   set superusers="grubadmin"
+   password_pbkdf2 grubadmin grub.pbkdf2.sha512.10000.REPLACE_WITH_YOUR_HASH
+   EOF
+   # Allow normal boots without a password (editing still requires it):
+   sudo sed -i 's/^CLASS="--class gnu-linux --class gnu --class os"$/CLASS="--class gnu-linux --class gnu --class os --unrestricted"/' /etc/grub.d/10_linux
+   sudo update-grub
+
+2. Enable audit from early boot (+ AppArmor on Ubuntu):  [L2]
+   ----------------------------------------------------
+   [RHEL]
+   sudo grubby --update-kernel=ALL --args="audit=1 audit_backlog_limit=8192"
+   sudo grubby --info=ALL | grep args
+
+   [UBUNTU]
+   grep -q 'audit=1' /etc/default/grub || \
+     sudo sed -i 's/^GRUB_CMDLINE_LINUX="/&audit=1 audit_backlog_limit=8192 apparmor=1 security=apparmor /' /etc/default/grub
+   sudo update-grub
+
+3. Restrict bootloader config permissions:  [L1]
+   ---------------------------------------
+   [RHEL]
+   sudo chown root:root /boot/grub2/grub.cfg /boot/grub2/grubenv
+   sudo chmod 600 /boot/grub2/grub.cfg /boot/grub2/grubenv
+   [ -f /boot/grub2/user.cfg ] && sudo chmod 600 /boot/grub2/user.cfg
+   # UEFI systems: /boot/efi is vfat and ignores chmod. Instead add
+   # 'umask=0077,uid=0,gid=0' to the /boot/efi line in /etc/fstab.
+
+   [UBUNTU]
+   sudo chown root:root /boot/grub/grub.cfg
+   sudo chmod 400 /boot/grub/grub.cfg
+   # Re-check after every update-grub; regeneration can reset permissions.
+
+
+--------------------------------------------------------------------------------
+PHASE 4: KERNEL & NETWORK PARAMETERS (SYSCTL), CORE DUMPS
+--------------------------------------------------------------------------------
+1. Hardened sysctl settings:  [L1]  (same file on both distributions)
+   -------------------------
+   cat << 'EOF' | sudo tee /etc/sysctl.d/60-cis-hardening.conf
+   # ---- Routing / forwarding (see EXCEPTIONS for container & router hosts)
+   net.ipv4.ip_forward = 0
+   net.ipv6.conf.all.forwarding = 0
+
+   # ---- Do not send ICMP redirects
+   net.ipv4.conf.all.send_redirects = 0
+   net.ipv4.conf.default.send_redirects = 0
+
+   # ---- Do not accept ICMP redirects / source-routed packets
+   net.ipv4.conf.all.accept_redirects = 0
+   net.ipv4.conf.default.accept_redirects = 0
+   net.ipv6.conf.all.accept_redirects = 0
+   net.ipv6.conf.default.accept_redirects = 0
+   net.ipv4.conf.all.secure_redirects = 0
+   net.ipv4.conf.default.secure_redirects = 0
+   net.ipv4.conf.all.accept_source_route = 0
+   net.ipv4.conf.default.accept_source_route = 0
+   net.ipv6.conf.all.accept_source_route = 0
+   net.ipv6.conf.default.accept_source_route = 0
+
+   # ---- Log and filter suspicious packets
+   net.ipv4.conf.all.log_martians = 1
+   net.ipv4.conf.default.log_martians = 1
+   net.ipv4.conf.all.rp_filter = 1
+   net.ipv4.conf.default.rp_filter = 1
+   net.ipv4.icmp_echo_ignore_broadcasts = 1
+   net.ipv4.icmp_ignore_bogus_error_responses = 1
+   net.ipv4.tcp_syncookies = 1
+
+   # ---- Do not accept IPv6 router advertisements (static/DHCPv6 hosts)
+   net.ipv6.conf.all.accept_ra = 0
+   net.ipv6.conf.default.accept_ra = 0
+
+   # ---- Kernel self-protection
+   kernel.randomize_va_space = 2
+   kernel.yama.ptrace_scope = 1
+   kernel.dmesg_restrict = 1
+   kernel.kptr_restrict = 2
+   kernel.unprivileged_bpf_disabled = 1
+   fs.suid_dumpable = 0
+   fs.protected_hardlinks = 1
+   fs.protected_symlinks = 1
+   EOF
+
+   sudo sysctl --system
+   sudo sysctl -w net.ipv4.route.flush=1
+   sudo sysctl -w net.ipv6.route.flush=1
+
+2. Ubuntu: stop ufw from overriding these values:  [UBUNTU] [L1]
+   ----------------------------------------------
+   ufw applies its own /etc/ufw/sysctl.conf on start, which can undo the
+   settings above. Point it at /etc/sysctl.conf instead:
+
+   sudo sed -i 's|^IPT_SYSCTL=.*|IPT_SYSCTL=/etc/sysctl.conf|' /etc/default/ufw
+
+3. Disable core dumps:  [L1]  [ALL]
+   -------------------
+   echo '* hard core 0' | sudo tee /etc/security/limits.d/60-cis-coredump.conf
+
+   sudo mkdir -p /etc/systemd/coredump.conf.d
+   cat << 'EOF' | sudo tee /etc/systemd/coredump.conf.d/60-cis.conf
+   [Coredump]
+   Storage=none
+   ProcessSizeMax=0
+   EOF
+
+4. Verify:  [ALL]
+   -------
+   sudo sysctl net.ipv4.ip_forward net.ipv4.conf.all.send_redirects \
+     net.ipv4.conf.all.rp_filter kernel.randomize_va_space fs.suid_dumpable
+
+
+--------------------------------------------------------------------------------
+PHASE 5: SYSTEM-WIDE CRYPTOGRAPHY
+--------------------------------------------------------------------------------
+1. RHEL crypto policy:  [RHEL] [L1]
+   -------------------
+   RHEL controls TLS, SSH, Kerberos and more through one system-wide policy.
+   Use it instead of hard-coding cipher lists in each service.
+
+   update-crypto-policies --show       # must NOT be LEGACY
+
+   # Sub-policies that remove weak SSH ciphers and short MACs:
+   echo 'cipher@SSH = -*-CBC'            | sudo tee /etc/crypto-policies/policies/modules/NO-SSHCBC.pmod
+   echo 'mac = -*-64*'                   | sudo tee /etc/crypto-policies/policies/modules/NO-WEAKMAC.pmod
+   echo 'cipher@SSH = -CHACHA20-POLY1305' | sudo tee /etc/crypto-policies/policies/modules/NO-SSHCHACHA20.pmod
+
+   sudo update-crypto-policies --set DEFAULT:NO-SHA1:NO-SSHCBC:NO-WEAKMAC:NO-SSHCHACHA20
+   update-crypto-policies --show
+   # A reboot is required for every service to pick up the new policy.
+
+   NOTES
+   * NO-SHA1 can break very old clients, appliances and SHA-1-signed
+     certificates. Test first; drop ":NO-SHA1" if something critical breaks.
+   * NO-SSHCHACHA20 mitigates the "Terrapin" SSH attack (CVE-2023-48795) on
+     peers that are not patched.
+
+2. Ubuntu:  [UBUNTU]
+   -------
+   Ubuntu has no system-wide crypto policy tool. SSH algorithms are set
+   directly in PHASE 10 (01-cis-crypto.conf).
+
+
+--------------------------------------------------------------------------------
+PHASE 6: MANDATORY ACCESS CONTROL
+--------------------------------------------------------------------------------
+1. SELinux:  [RHEL] [L1]
+   --------
+   sudo dnf install -y libselinux
+   sudo sed -i 's/^SELINUX=.*/SELINUX=enforcing/' /etc/selinux/config
+   sudo sed -i 's/^SELINUXTYPE=.*/SELINUXTYPE=targeted/' /etc/selinux/config
+   sudo grubby --update-kernel ALL --remove-args "selinux=0 enforcing=0"
+   sudo dnf remove -y setroubleshoot mcstrans 2>/dev/null
+   sestatus
+
+   If SELinux is currently DISABLED, do NOT jump straight to enforcing:
+     1. Set SELINUX=permissive in /etc/selinux/config
+     2. sudo touch /.autorelabel && sudo reboot      (relabel takes time)
+     3. Review denials:  sudo ausearch -m avc -ts recent
+     4. Fix denials, then set SELINUX=enforcing and run 'sudo setenforce 1'
+
+   Look for processes running unconfined:
+     ps -eZ | grep unconfined_service_t
+
+2. AppArmor:  [UBUNTU] [L1]
+   ---------
+   sudo apt install -y apparmor apparmor-utils
+   # Kernel arguments were added in PHASE 3, step 2.
+   sudo aa-status
+
+   [L1] requires every profile to be in enforce OR complain mode.
+   [L2] requires every profile to be in enforce mode:
+     sudo aa-enforce /etc/apparmor.d/*
+   Test applications after switching profiles to enforce.
+
+
+--------------------------------------------------------------------------------
+PHASE 7: UNUSED KERNEL MODULES (FILESYSTEMS, PROTOCOLS, USB STORAGE)
+--------------------------------------------------------------------------------
+1. Disable modules:  [ALL]
+   ----------------
+   CIS prefers both an 'install ... /bin/false' line (blocks loading) and a
+   'blacklist' line (blocks auto-loading).
+
+   cat << 'EOF' | sudo tee /etc/modprobe.d/60-cis-disable.conf
+   # ---- Uncommon filesystems  [L1]
+   install cramfs /bin/false
+   blacklist cramfs
+   install freevxfs /bin/false
+   blacklist freevxfs
+   install hfs /bin/false
+   blacklist hfs
+   install hfsplus /bin/false
+   blacklist hfsplus
+   install jffs2 /bin/false
+   blacklist jffs2
+
+   # ---- USB mass storage  [L1]
+   install usb-storage /bin/false
+   blacklist usb-storage
+
+   # ---- Uncommon network protocols  [L2]
+   install dccp /bin/false
+   blacklist dccp
+   install rds /bin/false
+   blacklist rds
+   install sctp /bin/false
+   blacklist sctp
+   install tipc /bin/false
+   blacklist tipc
+   EOF
+
+   Optional additions -- read EXCEPTIONS first:
+     udf       [L2]  breaks Azure VM provisioning and ISO/DVD mounting
+     squashfs  [L2]  breaks snap packages on Ubuntu (do NOT add on Ubuntu)
+
+2. Unload anything currently loaded and rebuild initramfs:  [ALL]
+   ------------------------------------------------------
+   for m in cramfs freevxfs hfs hfsplus jffs2 usb_storage dccp rds sctp tipc; do
+     sudo modprobe -r "$m" 2>/dev/null
+   done
+
+   [RHEL]    sudo dracut -f
+   [UBUNTU]  sudo update-initramfs -u
+
+3. Verify:  [ALL]
+   -------
+   sudo modprobe -n -v cramfs        # should print: install /bin/false
+   lsmod | grep -E 'cramfs|usb_storage|sctp' || echo "none loaded"
+
+
+--------------------------------------------------------------------------------
+PHASE 8: SERVICES, TIME SYNC, CRON
+--------------------------------------------------------------------------------
+1. Remove legacy / insecure packages:  [L1]
+   ----------------------------------
+   [RHEL]
+   for p in telnet telnet-server tftp tftp-server rsh rsh-server talk \
+            talk-server ypbind ypserv xinetd; do
+     rpm -q "$p" &>/dev/null && sudo dnf remove -y "$p"
+   done
+
+   [UBUNTU]
+   for p in telnet inetutils-telnet telnetd tftp tftpd-hpa rsh-client \
+            rsh-server talk talkd nis xinetd prelink; do
+     dpkg -s "$p" &>/dev/null && sudo apt purge -y "$p"
+   done
+
+2. Review and disable services you do not need:  [L1]
+   ---------------------------------------------
+   List what is listening and enabled:
+     sudo ss -tulpn
+     systemctl list-unit-files --type=service --state=enabled
+
+   Candidates to disable/remove if the host does not provide that service:
+     RHEL   : avahi-daemon cups dhcpd named vsftpd httpd nginx dovecot smb
+              squid snmpd rpcbind nfs-server autofs rsyncd
+     Ubuntu : avahi-daemon cups isc-dhcp-server bind9 vsftpd apache2 nginx
+              dovecot-core smbd squid snmpd rpcbind nfs-kernel-server autofs
+              rsync slapd
+   Disable with:
+     sudo systemctl disable --now <service>
+     sudo systemctl mask <service>      # stops it being started as a dependency
+
+3. Mail transfer agent: local-only:  [L1]  [ALL]
+   --------------------------------
+   If postfix is installed:
+     sudo postconf -e 'inet_interfaces = loopback-only'
+     sudo systemctl restart postfix
+   Verify nothing but localhost listens on port 25:
+     sudo ss -lntp | grep ':25 '
+
+4. Ubuntu: disable automatic crash reporting:  [UBUNTU] [L1]
+   ------------------------------------------
+   sudo systemctl disable --now apport 2>/dev/null
+   [ -f /etc/default/apport ] && sudo sed -i 's/^enabled=1/enabled=0/' /etc/default/apport
+
+5. Time synchronization:  [L1]
+   ---------------------
+   [RHEL]  chrony
+   sudo dnf install -y chrony
+   # Add your approved time sources to /etc/chrony.conf, e.g.:
+   #   server time1.example.com iburst
+   #   server time2.example.com iburst
+   grep -E '^(server|pool)' /etc/chrony.conf
+   grep OPTIONS /etc/sysconfig/chronyd       # must include: -u chrony
+   sudo systemctl enable --now chronyd
+   chronyc sources
+
+   [UBUNTU]  systemd-timesyncd (use only ONE time daemon)
+   sudo mkdir -p /etc/systemd/timesyncd.conf.d
+   cat << 'EOF' | sudo tee /etc/systemd/timesyncd.conf.d/60-cis.conf
+   [Time]
+   NTP=time1.example.com time2.example.com
+   FallbackNTP=ntp.ubuntu.com
+   EOF
+   sudo systemctl enable --now systemd-timesyncd
+   timedatectl timesync-status
+   # If you prefer chrony: 'sudo apt install chrony' (removes timesyncd) and
+   # put servers in /etc/chrony/sources.d/*.sources
+
+6. Cron and at permissions:  [L1]
+   ------------------------
+   [RHEL]    sudo systemctl enable --now crond
+   [UBUNTU]  sudo systemctl enable --now cron
+
+   [ALL]
+   sudo chown root:root /etc/crontab
+   sudo chmod 600 /etc/crontab
+   for d in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly \
+            /etc/cron.monthly /etc/cron.d; do
+     sudo chown root:root "$d" && sudo chmod 700 "$d"
+   done
+
+   # Allow-lists (only users listed may use cron/at):
+   sudo rm -f /etc/cron.deny /etc/at.deny
+   sudo touch /etc/cron.allow /etc/at.allow
+   sudo chmod 640 /etc/cron.allow /etc/at.allow
+
+   [RHEL]
+   sudo chown root:root /etc/cron.allow /etc/at.allow
+
+   [UBUNTU]   (the crontab/at binaries need group read access)
+   sudo chown root:crontab /etc/cron.allow
+   sudo chown root:daemon  /etc/at.allow
+
+
+--------------------------------------------------------------------------------
+PHASE 9: LOGIN BANNERS
+--------------------------------------------------------------------------------
+1. Banner text:  [L1]  [ALL]
+   ------------
+   Banners must not reveal OS name, version, kernel or architecture
+   (no \m, \r, \s or \v escapes). Have your legal team approve the wording.
+
+   cat << 'EOF' | sudo tee /etc/issue /etc/issue.net /etc/motd
+   WARNING: AUTHORIZED USE ONLY
+
+   This system is the property of <ORGANIZATION NAME> and is for authorized
+   business use only. All activity on this system may be monitored, recorded
+   and audited. By continuing, you consent to such monitoring. Unauthorized
+   use may result in disciplinary action and civil and/or criminal penalties.
+   EOF
+
+2. Permissions:  [L1]  [ALL]
+   ------------
+   sudo chown root:root /etc/motd /etc/issue /etc/issue.net
+   sudo chmod 644 /etc/motd /etc/issue /etc/issue.net
+
+3. Ubuntu dynamic MOTD:  [UBUNTU] [REC]
+   --------------------
+   Ubuntu builds the login message from scripts that print the OS release.
+   To stop that and the news feed:
+   sudo chmod -x /etc/update-motd.d/00-header /etc/update-motd.d/10-help-text \
+                 /etc/update-motd.d/50-motd-news 2>/dev/null
+   [ -f /etc/default/motd-news ] && sudo sed -i 's/^ENABLED=1/ENABLED=0/' /etc/default/motd-news
+
+
+--------------------------------------------------------------------------------
+PHASE 10: OPENSSH SERVER
+--------------------------------------------------------------------------------
+WHY THE FILE IS NAMED 00-...
+  sshd uses the FIRST value it reads for most settings, and drop-in files are
+  read in alphabetical order. Vendor files such as 50-redhat.conf and
+  50-cloud-init.conf (which often sets PasswordAuthentication yes) would
+  otherwise win. Naming the file 00-cis-hardening.conf makes ours load first.
+
+1. Prepare access BEFORE applying (lockout prevention):  [ALL]
+   ---------------------------------------------------
+   This config restricts SSH to members of the 'sshusers' group and turns
+   off password logins.
+
+   sudo groupadd -f sshusers
+   sudo usermod -aG sshusers <your-admin-user>       # repeat for each admin
+   # Confirm each admin has a working key:
+   ls -l /home/<your-admin-user>/.ssh/authorized_keys
+
+2. Hardened settings:  [L1]  [ALL]
+   ------------------
+   cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/00-cis-hardening.conf
+   # ---- Access control
+   AllowGroups sshusers
+   PermitRootLogin no
+   PermitEmptyPasswords no
+   PermitUserEnvironment no
+   HostbasedAuthentication no
+   IgnoreRhosts yes
+   UsePAM yes
+
+   # ---- Authentication
+   PubkeyAuthentication yes
+   PasswordAuthentication no          # not a CIS requirement; recommended
+   KbdInteractiveAuthentication no
+   GSSAPIAuthentication no            # [L2]
+   MaxAuthTries 4
+   LoginGraceTime 60
+
+   # ---- Sessions
+   MaxSessions 10
+   MaxStartups 10:30:60
+   ClientAliveInterval 15
+   ClientAliveCountMax 3              # drops dead/idle-unresponsive clients
+                                      # after ~45s; never set this to 0
+
+   # ---- Forwarding (blocks port forwarding, X11 and agent forwarding)
+   DisableForwarding yes
+
+   # ---- Logging & banner
+   LogLevel VERBOSE
+   Banner /etc/issue.net
+   EOF
+
+3. Cryptographic algorithms:
+   -------------------------
+   [RHEL]
+   Do NOT set Ciphers/MACs/KexAlgorithms here. The crypto policy from
+   PHASE 5 controls them; hard-coded lists would be ignored or conflict.
+
+   [UBUNTU] [L1]
+   cat << 'EOF' | sudo tee /etc/ssh/sshd_config.d/01-cis-crypto.conf
+   Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+   MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+   KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha256
+   EOF
+   # chacha20-poly1305 and all CBC ciphers are omitted (Terrapin, CVE-2023-48795).
+
+4. File permissions:  [L1]
+   -----------------
+   [ALL]
+   sudo chown root:root /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf
+   sudo chmod 600 /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf
+   sudo chmod 644 /etc/ssh/ssh_host_*_key.pub
+
+   [RHEL]
+   sudo chown root:ssh_keys /etc/ssh/ssh_host_*_key
+   sudo chmod 640 /etc/ssh/ssh_host_*_key
+
+   [UBUNTU]
+   sudo chown root:root /etc/ssh/ssh_host_*_key
+   sudo chmod 600 /etc/ssh/ssh_host_*_key
+
+5. Test, check effective config, reload:  [ALL]
+   -------------------------------------
+   sudo sshd -t                                    # syntax check
+   sudo sshd -T | grep -Ei 'allowgroups|permitrootlogin|passwordauthentication|clientalive|maxauthtries|ciphers|macs|kexalgorithms|disableforwarding'
+   # 'sshd -T' shows what sshd will ACTUALLY use -- confirm every value.
+
+   [RHEL]    sudo systemctl reload sshd
+   [UBUNTU]  sudo systemctl reload ssh
+
+   Now open a NEW session from another terminal. Close your safety session
+   only after the new login works.
+
+
+--------------------------------------------------------------------------------
+PHASE 11: PAM, PASSWORDS, ACCOUNT LOCKOUT, SUDO, SU
+--------------------------------------------------------------------------------
+1. Password quality:  [L1]
+   -----------------
+   [UBUNTU]  sudo apt install -y libpam-pwquality
+
+   [ALL]
+   sudo mkdir -p /etc/security/pwquality.conf.d
+   cat << 'EOF' | sudo tee /etc/security/pwquality.conf.d/60-cis.conf
+   minlen = 14
+   minclass = 4
+   difok = 2
+   maxrepeat = 3
+   maxsequence = 3
+   dictcheck = 1
+   enforce_for_root
+   EOF
+
+2. Account lockout (pam_faillock):  [L1]
+   -------------------------------
+   [ALL]
+   cat << 'EOF' | sudo tee /etc/security/faillock.conf
+   deny = 5
+   fail_interval = 900
+   unlock_time = 900
+   even_deny_root
+   root_unlock_time = 60
+   EOF
+   # root_unlock_time keeps a mistyped root password from locking the
+   # console for 15 minutes during an incident.
+
+   [RHEL]
+   sudo authselect current                 # confirm a profile is in use
+   sudo authselect enable-feature with-faillock
+   # (apply-changes is run in step 4)
+
+   [UBUNTU]
+   cat << 'EOF' | sudo tee /usr/share/pam-configs/faillock
+   Name: Enable pam_faillock to deny access
+   Default: yes
+   Priority: 0
+   Auth-Type: Primary
+   Auth:
+           [default=die] pam_faillock.so authfail
+   EOF
+
+   cat << 'EOF' | sudo tee /usr/share/pam-configs/faillock_notify
+   Name: Notify of failed login attempts and reset count upon success
+   Default: yes
+   Priority: 1024
+   Auth-Type: Primary
+   Auth:
+           requisite pam_faillock.so preauth
+   Account-Type: Primary
+   Account:
+           required pam_faillock.so
+   EOF
+
+   sudo pam-auth-update --enable faillock faillock_notify
+
+   Unlock a user:   sudo faillock --user <name> --reset
+
+3. Password history:  [L1]
+   -----------------
+   [RHEL]  (RHEL 9.1 and later)
+   cat << 'EOF' | sudo tee /etc/security/pwhistory.conf
+   remember = 24
+   enforce_for_root
+   EOF
+   sudo authselect enable-feature with-pwhistory
+
+   [UBUNTU]
+   cat << 'EOF' | sudo tee /usr/share/pam-configs/pwhistory
+   Name: pwhistory password history checking
+   Default: yes
+   Priority: 1024
+   Password-Type: Primary
+   Password:
+           requisite pam_pwhistory.so remember=24 enforce_for_root try_first_pass use_authtok
+   EOF
+   sudo pam-auth-update --enable pwhistory
+
+4. Disallow empty passwords (remove nullok):  [L1]
+   -----------------------------------------
+   [RHEL]
+   sudo authselect enable-feature without-nullok
+   sudo authselect apply-changes
+   sudo authselect check
+
+   [UBUNTU]
+   sudo sed -i 's/\s\+nullok\b//g' /usr/share/pam-configs/unix
+   sudo pam-auth-update --enable unix
+   grep -n nullok /etc/pam.d/common-* || echo "nullok removed"
+
+5. Password aging and inactivity:  [L1]  [ALL]
+   ------------------------------
+   sudo sed -ri 's/^\s*PASS_MAX_DAYS\s+.*/PASS_MAX_DAYS   365/' /etc/login.defs
+   sudo sed -ri 's/^\s*PASS_MIN_DAYS\s+.*/PASS_MIN_DAYS   1/'   /etc/login.defs
+   sudo sed -ri 's/^\s*PASS_WARN_AGE\s+.*/PASS_WARN_AGE   7/'   /etc/login.defs
+   grep -E '^\s*ENCRYPT_METHOD' /etc/login.defs   # SHA512 (RHEL) or YESCRYPT (Ubuntu)
+   sudo useradd -D -f 45                          # lock accounts 45 days after expiry
+
+   # Apply to existing accounts that have a password set:
+   for u in $(sudo awk -F: '($2 ~ /^\$/) {print $1}' /etc/shadow); do
+     sudo chage --maxdays 365 --mindays 1 --warndays 7 "$u"
+   done
+
+   NOTE: an expired password blocks SSH key logins too (PAM forces a
+   password change). Make sure key-only admins rotate or are monitored.
+
+6. Default umask 027:  [L1]  [ALL]
+   ------------------
+   sudo sed -ri 's/^\s*UMASK\s+.*/UMASK           027/' /etc/login.defs
+   echo 'umask 027' | sudo tee /etc/profile.d/60-cis-umask.sh
+
+   [RHEL]  /etc/bashrc and /etc/profile may set their own umask:
+   sudo sed -ri 's/^(\s*)umask\s+[0-7]+/\1umask 027/' /etc/bashrc /etc/profile
+   [UBUNTU] pam_umask is enabled by default in /etc/pam.d/common-session:
+   grep pam_umask /etc/pam.d/common-session
+
+7. Idle shell timeout:  [L1]  [ALL]
+   -------------------
+   cat << 'EOF' | sudo tee /etc/profile.d/60-cis-tmout.sh
+   TMOUT=900
+   readonly TMOUT
+   export TMOUT
+   EOF
+
+8. sudo hardening:  [L1]  [ALL]
+   ---------------
+   A syntax error in a sudoers file can lock you out of sudo, so validate
+   before installing:
+
+   cat << 'EOF' > ~/60-cis-sudo
+   Defaults use_pty
+   Defaults logfile="/var/log/sudo.log"
+   Defaults timestamp_timeout=15
+   EOF
+   sudo visudo -cf ~/60-cis-sudo && \
+     sudo install -o root -g root -m 0440 ~/60-cis-sudo /etc/sudoers.d/60-cis-sudo
+   rm -f ~/60-cis-sudo
+
+   # Find NOPASSWD / !authenticate entries and remove them unless justified:
+   sudo grep -RnE 'NOPASSWD|!authenticate' /etc/sudoers /etc/sudoers.d/
+
+9. Restrict su to an (empty) group:  [L1]  [ALL]
+   --------------------------------
+   sudo groupadd -f sugroup
+   grep -q 'pam_wheel.so.*group=sugroup' /etc/pam.d/su || \
+     echo 'auth required pam_wheel.so use_uid group=sugroup' | sudo tee -a /etc/pam.d/su
+   # Leave sugroup empty. Admins use sudo instead of su.
+
+
+--------------------------------------------------------------------------------
+PHASE 12: HOST FIREWALL
+--------------------------------------------------------------------------------
+Use exactly ONE firewall manager per host.
+
+1. firewalld:  [RHEL] [L1]
+   ----------
+   sudo dnf install -y firewalld
+   sudo systemctl disable --now iptables ip6tables nftables 2>/dev/null
+   sudo systemctl enable --now firewalld
+
+   # See which zone your interface is in (usually 'public'):
+   sudo firewall-cmd --get-active-zones
+
+   # Allow SSH FIRST, then remove services you do not need:
+   sudo firewall-cmd --permanent --zone=public --add-service=ssh
+   sudo firewall-cmd --permanent --zone=public --remove-service=cockpit 2>/dev/null
+   sudo firewall-cmd --permanent --zone=public --remove-service=dhcpv6-client 2>/dev/null
+
+   # Loopback: trust lo, drop spoofed loopback-sourced traffic
+   sudo firewall-cmd --permanent --zone=trusted --add-interface=lo
+   sudo firewall-cmd --permanent --zone=trusted --add-rich-rule='rule family=ipv4 source address="127.0.0.1" destination not address="127.0.0.1" drop'
+   sudo firewall-cmd --permanent --zone=trusted --add-rich-rule='rule family=ipv6 source address="::1" destination not address="::1" drop'
+
+   sudo firewall-cmd --reload
+   sudo firewall-cmd --list-all --zone=public
+
+2. ufw:  [UBUNTU] [L1]
+   ----
+   sudo apt install -y ufw
+   sudo apt purge -y iptables-persistent 2>/dev/null
+   sudo systemctl disable --now nftables 2>/dev/null
+
+   # Loopback
+   sudo ufw allow in on lo
+   sudo ufw allow out on lo
+   sudo ufw deny in from 127.0.0.0/8
+   sudo ufw deny in from ::1
+
+   # Allow SSH BEFORE enabling (limit = basic brute-force rate limiting)
+   sudo ufw limit OpenSSH
+
+   # Default policies
+   sudo ufw default deny incoming
+   sudo ufw default deny routed
+   sudo ufw default allow outgoing
+   sudo ufw logging on
+   sudo ufw --force enable
+   sudo ufw status verbose
+
+   STRICT CIS VARIANT -- CIS also expects outbound default-deny. Only do
+   this once you know every outbound flow the server needs:
+     sudo ufw allow out 53                  # DNS
+     sudo ufw allow out 123/udp             # NTP
+     sudo ufw allow out 80/tcp              # package mirrors
+     sudo ufw allow out 443/tcp             # package mirrors / APIs
+     sudo ufw allow out to <loghost> port 514 proto tcp
+     sudo ufw default deny outgoing
+
+
+--------------------------------------------------------------------------------
+PHASE 13: SYSTEM LOGGING (JOURNALD + RSYSLOG)
+--------------------------------------------------------------------------------
+1. journald:  [L1]  [ALL]
+   ---------
+   sudo mkdir -p /etc/systemd/journald.conf.d
+   cat << 'EOF' | sudo tee /etc/systemd/journald.conf.d/60-cis.conf
+   [Journal]
+   Storage=persistent
+   Compress=yes
+   ForwardToSyslog=yes
+   EOF
+   sudo systemctl restart systemd-journald
+
+2. rsyslog:  [L1]
+   --------
+   [RHEL]    sudo dnf install -y rsyslog
+   [UBUNTU]  sudo apt install -y rsyslog
+
+   [ALL]
+   echo '$FileCreateMode 0640' | sudo tee /etc/rsyslog.d/60-cis.conf
+   sudo systemctl enable --now rsyslog
+
+3. Forward logs to a central server:  [L1]  [ALL]
+   ---------------------------------
+   Logs kept only on the host can be erased by an attacker who gets root.
+
+   cat << 'EOF' | sudo tee /etc/rsyslog.d/90-remote.conf
+   *.* action(type="omfwd" target="loghost.example.com" port="514" protocol="tcp"
+              action.resumeRetryCount="100"
+              queue.type="LinkedList" queue.size="10000")
+   EOF
+   sudo rsyslogd -N1 && sudo systemctl restart rsyslog
+   # Use TLS (gtls driver) or RELP if logs cross untrusted networks.
+   # Do NOT enable imtcp/imudp (log reception) unless this host IS the loghost.
+
+
+--------------------------------------------------------------------------------
+PHASE 14: SYSTEM AUDITING (AUDITD)
+--------------------------------------------------------------------------------
+Most auditd controls are CIS [L2], but auditing is strongly recommended on
+every server. The rules below cover the CIS rule set for 64-bit hosts and
+include 32-bit (b32) syscalls, which can otherwise be used to bypass rules.
+
+1. Install and enable:  [L2]
+   -------------------
+   [RHEL]    sudo dnf install -y audit audit-libs
+   [UBUNTU]  sudo apt install -y auditd audispd-plugins
+
+   [ALL]     sudo systemctl enable --now auditd
+
+2. Log retention and disk-full behaviour (/etc/audit/auditd.conf):  [L2]
+   ---------------------------------------------------------------
+   sudo sed -ri \
+     -e 's/^\s*max_log_file\s*=.*/max_log_file = 32/' \
+     -e 's/^\s*max_log_file_action\s*=.*/max_log_file_action = keep_logs/' \
+     -e 's/^\s*space_left_action\s*=.*/space_left_action = email/' \
+     -e 's/^\s*action_mail_acct\s*=.*/action_mail_acct = root/' \
+     -e 's/^\s*admin_space_left_action\s*=.*/admin_space_left_action = single/' \
+     -e 's/^\s*disk_full_action\s*=.*/disk_full_action = single/' \
+     -e 's/^\s*disk_error_action\s*=.*/disk_error_action = syslog/' \
+     /etc/audit/auditd.conf
+
+   OPERATIONAL WARNING
+   * keep_logs never deletes audit logs -- monitor /var/log/audit usage.
+   * 'single' drops the host to single-user mode when the audit disk fills.
+     This is what CIS L2 expects. If availability matters more than audit
+     completeness on a given host, set these to 'syslog' and document the
+     exception.
+
+3. Audit rules (one file per topic in /etc/audit/rules.d/):  [L2]
+   --------------------------------------------------------
+   Keep the distribution's default audit.rules file; add these alongside it.
+
+   # ---- Changes to sudo configuration
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-scope.rules
+   -w /etc/sudoers -p wa -k scope
+   -w /etc/sudoers.d -p wa -k scope
+   EOF
+
+   # ---- Commands run as another user (e.g. via sudo)
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-user_emulation.rules
+   -a always,exit -F arch=b64 -C euid!=uid -F auid!=unset -S execve -k user_emulation
+   -a always,exit -F arch=b32 -C euid!=uid -F auid!=unset -S execve -k user_emulation
+   EOF
+
+   # ---- sudo log file
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-sudo.rules
+   -w /var/log/sudo.log -p wa -k sudo_log_file
+   EOF
+
+   # ---- Date and time changes
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-time-change.rules
+   -a always,exit -F arch=b64 -S adjtimex,settimeofday -k time-change
+   -a always,exit -F arch=b32 -S adjtimex,settimeofday -k time-change
+   -a always,exit -F arch=b64 -S clock_settime -F a0=0x0 -k time-change
+   -a always,exit -F arch=b32 -S clock_settime -F a0=0x0 -k time-change
+   -w /etc/localtime -p wa -k time-change
+   EOF
+
+   # ---- Network environment / hostname / banners
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-system_locale.rules
+   -a always,exit -F arch=b64 -S sethostname,setdomainname -k system-locale
+   -a always,exit -F arch=b32 -S sethostname,setdomainname -k system-locale
+   -w /etc/issue -p wa -k system-locale
+   -w /etc/issue.net -p wa -k system-locale
+   -w /etc/hosts -p wa -k system-locale
+   -w /etc/hostname -p wa -k system-locale
+   -w /etc/NetworkManager -p wa -k system-locale
+   EOF
+   [RHEL]    echo '-w /etc/sysconfig/network -p wa -k system-locale' | sudo tee -a /etc/audit/rules.d/50-system_locale.rules
+   [UBUNTU]  echo '-w /etc/netplan -p wa -k system-locale' | sudo tee -a /etc/audit/rules.d/50-system_locale.rules
+
+   # ---- Use of privileged (setuid/setgid) programs -- generated per host
+   for part in $(findmnt -n -l -k -it "$(awk '/nodev/ {print $2}' /proc/filesystems | paste -sd,)" \
+                 | grep -Pv 'noexec|nosuid' | awk '{print $1}'); do
+     sudo find "$part" -xdev -perm /6000 -type f 2>/dev/null | while read -r f; do
+       echo "-a always,exit -F path=$f -F perm=x -F auid>=1000 -F auid!=unset -k privileged"
+     done
+   done | sudo tee /etc/audit/rules.d/50-privileged.rules
+   # Re-run this block after installing software that adds setuid binaries.
+
+   # ---- Unsuccessful file access attempts
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-access.rules
+   -a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+   -a always,exit -F arch=b64 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+   -a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EACCES -F auid>=1000 -F auid!=unset -k access
+   -a always,exit -F arch=b32 -S creat,open,openat,truncate,ftruncate -F exit=-EPERM -F auid>=1000 -F auid!=unset -k access
+   EOF
+
+   # ---- User / group / authentication files
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-identity.rules
+   -w /etc/group -p wa -k identity
+   -w /etc/passwd -p wa -k identity
+   -w /etc/gshadow -p wa -k identity
+   -w /etc/shadow -p wa -k identity
+   -w /etc/security/opasswd -p wa -k identity
+   -w /etc/nsswitch.conf -p wa -k identity
+   -w /etc/pam.conf -p wa -k identity
+   -w /etc/pam.d -p wa -k identity
+   EOF
+
+   # ---- Permission / ownership / attribute changes
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-perm_mod.rules
+   -a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+   -a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+   -a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+   -a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+   -a always,exit -F arch=b32 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+   -a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+   EOF
+
+   # ---- Filesystem mounts
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-mounts.rules
+   -a always,exit -F arch=b64 -S mount -F auid>=1000 -F auid!=unset -k mounts
+   -a always,exit -F arch=b32 -S mount -F auid>=1000 -F auid!=unset -k mounts
+   EOF
+
+   # ---- Sessions and logins
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-session.rules
+   -w /var/run/utmp -p wa -k session
+   -w /var/log/wtmp -p wa -k session
+   -w /var/log/btmp -p wa -k session
+   -w /var/log/lastlog -p wa -k logins
+   -w /var/run/faillock -p wa -k logins
+   EOF
+
+   # ---- File deletion / rename by users
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-delete.rules
+   -a always,exit -F arch=b64 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+   -a always,exit -F arch=b32 -S unlink,unlinkat,rename,renameat -F auid>=1000 -F auid!=unset -k delete
+   EOF
+
+   # ---- Mandatory access control policy changes
+   [RHEL]
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-MAC-policy.rules
+   -w /etc/selinux -p wa -k MAC-policy
+   -w /usr/share/selinux -p wa -k MAC-policy
+   EOF
+   [UBUNTU]
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-MAC-policy.rules
+   -w /etc/apparmor -p wa -k MAC-policy
+   -w /etc/apparmor.d -p wa -k MAC-policy
+   EOF
+
+   # ---- ACL / context / account-modification tools
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-perm_chng.rules
+   -a always,exit -F path=/usr/bin/setfacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng
+   -a always,exit -F path=/usr/bin/chacl -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng
+   -a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k usermod
+   EOF
+   [RHEL]    echo '-a always,exit -F path=/usr/bin/chcon -F perm=x -F auid>=1000 -F auid!=unset -k perm_chng' | sudo tee -a /etc/audit/rules.d/50-perm_chng.rules
+
+   # ---- Kernel module loading / unloading
+   cat << 'EOF' | sudo tee /etc/audit/rules.d/50-kernel_modules.rules
+   -a always,exit -F arch=b64 -S init_module,finit_module,delete_module,create_module,query_module -F auid>=1000 -F auid!=unset -k kernel_modules
+   -a always,exit -F path=/usr/bin/kmod -F perm=x -F auid>=1000 -F auid!=unset -k kernel_modules
+   EOF
+
+   NOTE: the rule that locks the audit configuration (-e 2) is deliberately
+   NOT added here. It is added in PHASE 17, after compliance remediation,
+   so that remediation can still load audit rules without a reboot.
+
+4. Load and verify:  [ALL]
+   ----------------
+   sudo augenrules --check
+   sudo augenrules --load
+   sudo auditctl -l | wc -l          # number of loaded rules
+   sudo auditctl -s                  # 'enabled 1' until PHASE 17
+
+5. Audit log permissions:  [L2]  [ALL]
+   ----------------------
+   sudo chmod 750 /var/log/audit
+   sudo find /var/log/audit -type f -exec chmod 600 {} +
+   sudo chmod 640 /etc/audit/auditd.conf /etc/audit/rules.d/*.rules
+
+
+--------------------------------------------------------------------------------
+PHASE 15: FILE PERMISSIONS & ACCOUNT HYGIENE
+--------------------------------------------------------------------------------
+1. Identity file permissions:  [L1]
+   --------------------------
+   [ALL]
+   sudo chown root:root /etc/passwd /etc/passwd- /etc/group /etc/group-
+   sudo chmod 644 /etc/passwd /etc/passwd- /etc/group /etc/group-
+   sudo chown root:root /etc/security/opasswd 2>/dev/null
+   sudo chmod 600 /etc/security/opasswd 2>/dev/null
+
+   [RHEL]
+   sudo chown root:root /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-
+   sudo chmod 000 /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-
+
+   [UBUNTU]
+   sudo chown root:shadow /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-
+   sudo chmod 640 /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-
+
+2. Find risky files (review output, then fix):  [L1]  [ALL]
+   -------------------------------------------
+   # World-writable files
+   sudo find / -xdev -type f -perm -0002 -print
+   # World-writable directories without the sticky bit
+   sudo find / -xdev -type d \( -perm -0002 -a ! -perm -1000 \) -print
+   # Files with no valid owner or group
+   sudo find / -xdev \( -nouser -o -nogroup \) -print
+   # setuid / setgid inventory (keep for change tracking)
+   sudo find / -xdev -type f -perm /6000 -print | sudo tee /root/suid-sgid-inventory.txt
+
+3. Account checks (each should print nothing unexpected):  [L1]  [ALL]
+   ------------------------------------------------------
+   # Accounts with empty passwords
+   sudo awk -F: '($2 == "") {print $1}' /etc/shadow
+   # Accounts with UID 0 other than root
+   awk -F: '($3 == 0 && $1 != "root") {print $1}' /etc/passwd
+   # Duplicate UIDs / GIDs / user names / group names
+   cut -d: -f3 /etc/passwd | sort | uniq -d
+   cut -d: -f3 /etc/group  | sort | uniq -d
+   cut -d: -f1 /etc/passwd | sort | uniq -d
+   cut -d: -f1 /etc/group  | sort | uniq -d
+   # System accounts with a login shell (review; set to nologin if not needed)
+   awk -F: '($3 < 1000 && $1 !~ /^(root|sync|shutdown|halt)$/ && $7 !~ /(nologin|false)$/) {print $1": "$7}' /etc/passwd
+   #   fix with: sudo usermod -s /usr/sbin/nologin <account>
+
+4. Home directories:  [L1]  [ALL]
+   -----------------
+   for h in $(awk -F: '($3 >= 1000 && $7 !~ /(nologin|false)$/) {print $6}' /etc/passwd); do
+     [ -d "$h" ] && sudo chmod 750 "$h"
+   done
+   # Users' .netrc, .rhosts and .forward files should not exist:
+   sudo find /home /root -maxdepth 2 \( -name .netrc -o -name .rhosts -o -name .forward \) -print
+
+
+--------------------------------------------------------------------------------
+PHASE 16: AUTOMATED COMPLIANCE SCANNING & REMEDIATION
+--------------------------------------------------------------------------------
+Scan before and after. Treat automated remediation as a change you review,
+not a button you press on production.
+
+1. RHEL -- OpenSCAP with SCAP Security Guide:  [RHEL]
+   -----------------------------------------
+   sudo dnf install -y openscap-scanner scap-security-guide
+   sudo mkdir -p /root/compliance
+
+   # List available profiles (confirm the IDs on your system):
+   oscap info /usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml | grep -i cis
+
+   Profile IDs:
+     xccdf_org.ssgproject.content_profile_cis_server_l1        CIS L1 Server
+     xccdf_org.ssgproject.content_profile_cis                  CIS L2 Server
+     xccdf_org.ssgproject.content_profile_cis_workstation_l1   CIS L1 Workstation
+     xccdf_org.ssgproject.content_profile_cis_workstation_l2   CIS L2 Workstation
+
+   # Evaluate CIS Level 1 Server:
+   sudo oscap xccdf eval \
+     --profile xccdf_org.ssgproject.content_profile_cis_server_l1 \
+     --results-arf /root/compliance/cis_l1_arf.xml \
+     --report /root/compliance/cis_l1_report.html \
+     /usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml
+   # Exit code 2 just means "some rules failed" -- open the HTML report.
+
+   # Generate a remediation playbook for review:
+   oscap xccdf generate fix \
+     --profile xccdf_org.ssgproject.content_profile_cis_server_l1 \
+     --fix-type ansible \
+     --output /root/compliance/cis_l1_remediation.yml \
+     /usr/share/xml/scap/ssg/content/ssg-rhel9-ds.xml
+
+   # Ansible needs these packages/collections:
+   sudo dnf install -y ansible-core
+   ansible-galaxy collection install ansible.posix community.general
+
+   # Dry run first, then apply:
+   sudo ansible-playbook -i localhost, -c local /root/compliance/cis_l1_remediation.yml --check
+   sudo ansible-playbook -i localhost, -c local /root/compliance/cis_l1_remediation.yml
+
+   (Bash alternative: use '--fix-type bash' and read the script before
+   running it.)
+
+   RHEL 10: content file is ssg-rhel10-ds.xml.
+
+2. Ubuntu -- Ubuntu Security Guide (USG):  [UBUNTU]
+   -------------------------------------
+   USG is Canonical's supported CIS tooling. It requires Ubuntu Pro
+   (free for limited personal use; paid subscription for business).
+
+   sudo pro attach <YOUR_PRO_TOKEN>
+   sudo pro enable usg
+   sudo apt install -y usg
+
+   # Audit:
+   sudo usg audit cis_level1_server
+   # Report is written under /var/lib/usg/ (path printed at the end).
+
+   # Generate a fix script to review rather than applying blindly:
+   sudo usg generate-fix cis_level1_server --output /root/usg-cis-l1-fix.sh
+   # After review:
+   sudo bash /root/usg-cis-l1-fix.sh
+   # (Or: sudo usg fix cis_level1_server)
+
+   # Tailor rules you have documented exceptions for:
+   sudo usg generate-tailoring cis_level1_server /root/cis-tailoring.xml
+   sudo usg audit --tailoring-file /root/cis-tailoring.xml
+
+3. Ubuntu without Ubuntu Pro -- upstream OpenSCAP content:  [UBUNTU]
+   -----------------------------------------------------
+   Download the latest release ZIP of the ComplianceAsCode project
+   (github.com/ComplianceAsCode/content/releases), verify its checksum,
+   and extract ssg-ubuntu2204-ds.xml or ssg-ubuntu2404-ds.xml.
+
+   sudo apt install -y openscap-scanner     # 24.04
+   sudo apt install -y libopenscap8         # 22.04 (provides 'oscap')
+
+   sudo oscap xccdf eval \
+     --profile xccdf_org.ssgproject.content_profile_cis_level1_server \
+     --report /root/compliance/cis_l1_report.html \
+     ./ssg-ubuntu2404-ds.xml
+
+   Upstream content is community-maintained; results may differ slightly
+   from the official CIS-CAT tool.
+
+
+--------------------------------------------------------------------------------
+PHASE 17: FINALIZE -- FILE INTEGRITY BASELINE, LOCK AUDIT RULES, REBOOT
+--------------------------------------------------------------------------------
+Do this LAST, after all changes and remediation are complete, so the AIDE
+baseline reflects the hardened system.
+
+1. AIDE file integrity monitoring:  [L1]
+   -------------------------------
+   [RHEL]
+   sudo dnf install -y aide
+
+   # Protect the audit tools themselves:
+   cat << 'EOF' | sudo tee -a /etc/aide.conf
+
+   # CIS: audit tool integrity
+   /usr/sbin/auditctl p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/ausearch p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/aureport p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/autrace p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/augenrules p+i+n+u+g+s+b+acl+xattrs+sha512
+   EOF
+
+   sudo aide --init
+   sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+   sudo aide --check
+
+   # Daily scheduled check:
+   cat << 'EOF' | sudo tee /etc/systemd/system/aidecheck.service
+   [Unit]
+   Description=AIDE file integrity check
+
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/sbin/aide --check
+   EOF
+
+   cat << 'EOF' | sudo tee /etc/systemd/system/aidecheck.timer
+   [Unit]
+   Description=Daily AIDE file integrity check
+
+   [Timer]
+   OnCalendar=*-*-* 05:00:00
+   Persistent=true
+
+   [Install]
+   WantedBy=timers.target
+   EOF
+
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now aidecheck.timer
+
+   [UBUNTU]
+   sudo apt install -y aide aide-common
+
+   cat << 'EOF' | sudo tee /etc/aide/aide.conf.d/99_cis_audit_tools
+   /usr/sbin/auditctl p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/ausearch p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/aureport p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/autrace p+i+n+u+g+s+b+acl+xattrs+sha512
+   /usr/sbin/augenrules p+i+n+u+g+s+b+acl+xattrs+sha512
+   EOF
+
+   sudo aideinit -y -f
+   sudo cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+   sudo aide -c /etc/aide/aide.conf --check
+
+   # Scheduling: 24.04 ships a timer; 22.04 runs /etc/cron.daily/aide.
+   sudo systemctl enable --now dailyaidecheck.timer 2>/dev/null || \
+     ls -l /etc/cron.daily/aide
+
+   After every planned change (patching, config updates), update the
+   baseline so real tampering is not lost in noise:
+     RHEL   : sudo aide --update && sudo mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
+     Ubuntu : sudo aide -c /etc/aide/aide.conf --update && sudo cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+2. Make audit rules immutable:  [L2]  [ALL]
+   ---------------------------
+   echo '-e 2' | sudo tee /etc/audit/rules.d/99-finalize.rules
+   sudo augenrules --load
+   # From now on, audit rules can only change with a reboot.
+
+3. Reboot and verify:  [ALL]
+   ------------------
+   sudo reboot
+
+   After reboot:
+     sudo auditctl -s | grep enabled        # enabled 2
+     cat /proc/cmdline                      # audit=1 (and apparmor=1 on Ubuntu)
+     [RHEL]    sestatus; update-crypto-policies --show
+     [UBUNTU]  sudo aa-status | head
+     sudo sshd -T | grep -Ei 'permitrootlogin|allowgroups|passwordauthentication'
+     [RHEL]    sudo firewall-cmd --list-all
+     [UBUNTU]  sudo ufw status verbose
+     findmnt -n -o TARGET,OPTIONS /tmp /dev/shm
+
+4. Final compliance scan:  [ALL]
+   ----------------------
+   Re-run PHASE 16, save the report, and record any remaining failures with
+   a documented exception (owner, reason, compensating control, review date).
+
+
+================================================================================
+EXCEPTIONS -- KNOWN CONFLICTS (DOCUMENT ANY THAT APPLY)
+================================================================================
+Container hosts (Docker, Podman networks, Kubernetes nodes):
+  * net.ipv4.ip_forward must be 1. Kubernetes nodes also need bridge
+    netfilter settings. Override in a later file, e.g. 70-k8s.conf.
+  * The firewall rules above will conflict with CNI-managed rules; follow
+    your platform's firewall guidance.
+
+Routers, VPN gateways, load balancers, multi-homed hosts:
+  * ip_forward / send_redirects may be required.
+  * rp_filter = 1 (strict) breaks asymmetric routing; use 2 (loose) and
+    document it.
+
+IPv6 SLAAC hosts:
+  * accept_ra = 0 breaks hosts that get their IPv6 address from router
+    advertisements.
+
+Azure:
+  * Do not disable the udf module (VM provisioning uses a UDF ISO).
+
+Ubuntu:
+  * Do not disable squashfs -- snaps (including some core tooling) need it.
+
+Bastion / jump hosts and developer tunnels:
+  * DisableForwarding yes blocks SSH port forwarding and agent forwarding.
+    Set it to 'no' only on hosts that need it, and document the exception.
+
+Service accounts and automation:
+  * Password expiry (365 days) can block key-based automation accounts.
+    Use accounts with no password set ('!' or '*' in /etc/shadow) for
+    key-only automation.
+
+Availability-critical hosts:
+  * auditd 'single' disk-full actions take the host down by design. Decide
+    deliberately per host.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
